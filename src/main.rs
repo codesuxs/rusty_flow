@@ -1,8 +1,10 @@
-use pcap::{Device, Capture};
+use pcap::{Capture, Device};
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::IpAddr;
-use std::time::{SystemTime, Duration};
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 // Structure to represent a network flow
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -23,6 +25,12 @@ struct FlowStats {
     last_seen: SystemTime,
 }
 
+// Message type for thread communication
+struct PacketInfo {
+    flow: Flow,
+    bytes: u64,
+}
+
 impl FlowStats {
     fn new() -> Self {
         let now = SystemTime::now();
@@ -35,7 +43,6 @@ impl FlowStats {
     }
 }
 
-// Main flow tracking structure
 struct FlowTracker {
     flows: HashMap<Flow, FlowStats>,
 }
@@ -49,7 +56,7 @@ impl FlowTracker {
 
     fn update_flow(&mut self, flow: Flow, bytes: u64) {
         let now = SystemTime::now();
-        
+
         if let Some(stats) = self.flows.get_mut(&flow) {
             stats.packet_count += 1;
             stats.byte_count += bytes;
@@ -63,17 +70,27 @@ impl FlowTracker {
 
     fn print_stats(&self) {
         println!("\n=== Current Flow Statistics ===");
-        println!("{:<20} {:<20} {:<10} {:<10} {:<10} {:<15} {:<15} {:<15}",
-            "Source IP", "Destination IP", "Src Port", "Dst Port", "Protocol",
-            "Packets", "Bytes", "Duration(s)");
-        
+        println!(
+            "{:<20} {:<20} {:<10} {:<10} {:<10} {:<15} {:<15} {:<15}",
+            "Source IP",
+            "Destination IP",
+            "Src Port",
+            "Dst Port",
+            "Protocol",
+            "Packets",
+            "Bytes",
+            "Duration(s)"
+        );
+
         for (flow, stats) in &self.flows {
-            let duration = stats.last_seen
+            let duration = stats
+                .last_seen
                 .duration_since(stats.start_time)
                 .unwrap_or(Duration::from_secs(0))
                 .as_secs();
-            
-            println!("{:<20} {:<20} {:<10} {:<10} {:<10} {:<15} {:<15} {:<15}",
+
+            println!(
+                "{:<20} {:<20} {:<10} {:<10} {:<10} {:<15} {:<15} {:<15}",
                 flow.src_ip.to_string(),
                 flow.dst_ip.to_string(),
                 flow.src_port,
@@ -81,16 +98,37 @@ impl FlowTracker {
                 flow.protocol,
                 stats.packet_count,
                 stats.byte_count,
-                duration);
+                duration
+            );
         }
     }
 }
 
+fn packet_parser_thread(rx: Receiver<Vec<u8>>) -> Result<Receiver<PacketInfo>, Box<dyn Error>> {
+    let (tx, rx_main) = channel();
+    let tx_clone = tx.clone();
+
+    thread::spawn(move || {
+        while let Ok(packet_data) = rx.recv() {
+            if let Ok(flow) = parse_packet(&packet_data) {
+                let packet_info = PacketInfo {
+                    flow,
+                    bytes: packet_data.len() as u64,
+                };
+                if tx_clone.send(packet_info).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(rx_main)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Find the default device
-    let default_device = Device::lookup()?
-        .expect("No default device found");
-    
+    let default_device = Device::lookup()?.expect("No default device found");
+
     println!("Using device: {}", default_device.name);
 
     // Create a new capture handle
@@ -99,9 +137,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .snaplen(65535)
         .timeout(1000)
         .open()?;
-    
+
     // Set filter for TCP and UDP traffic
     cap.filter("tcp or udp", true)?;
+
+    // Create channels for communication between threads
+    let (tx_parser, rx_parser) = channel();
+    let tx_main = packet_parser_thread(rx_parser)?;
 
     let mut flow_tracker = FlowTracker::new();
     let mut last_print = SystemTime::now();
@@ -109,15 +151,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting flow tracking. Press Ctrl+C to stop.");
 
-    while let Ok(packet) = cap.next_packet() {
-        if let Ok(flow) = parse_packet(&packet.data) {
-            flow_tracker.update_flow(flow, packet.header.len as u64);
-        }
+    // Spawn a thread to handle statistics printing
+    let (tx_stats, rx_stats) = channel::<PacketInfo>();
+    thread::spawn(move || {
+        while let Ok(packet_info) = rx_stats.recv() {
+            flow_tracker.update_flow(packet_info.flow, packet_info.bytes);
 
-        // Print statistics every 5 seconds
-        if SystemTime::now().duration_since(last_print)? >= print_interval {
-            flow_tracker.print_stats();
-            last_print = SystemTime::now();
+            if SystemTime::now()
+                .duration_since(last_print)
+                .unwrap_or(Duration::from_secs(0))
+                >= print_interval
+            {
+                flow_tracker.print_stats();
+                last_print = SystemTime::now();
+            }
+        }
+    });
+
+    // Main capture loop
+    while let Ok(packet) = cap.next_packet() {
+        // Send packet data to parser thread
+        tx_parser.send(packet.data.to_vec())?;
+
+        // Forward parsed packet info to stats thread
+        if let Ok(packet_info) = tx_main.recv() {
+            tx_stats.send(packet_info)?;
         }
     }
 
@@ -127,23 +185,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn parse_packet(packet: &[u8]) -> Result<Flow, Box<dyn Error>> {
     // Skip Ethernet header (14 bytes)
     let ip_header = &packet[14..];
-    
+
     // Get IP version from first nibble
     let version = (ip_header[0] >> 4) & 0xF;
-    
+
     let (src_ip, dst_ip, protocol, header_length) = match version {
         4 => {
             // IPv4
             let header_length = ((ip_header[0] & 0xF) * 4) as usize;
             let protocol = ip_header[9];
             let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(
-                ip_header[12], ip_header[13], ip_header[14], ip_header[15]
+                ip_header[12],
+                ip_header[13],
+                ip_header[14],
+                ip_header[15],
             ));
             let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(
-                ip_header[16], ip_header[17], ip_header[18], ip_header[19]
+                ip_header[16],
+                ip_header[17],
+                ip_header[18],
+                ip_header[19],
             ));
             (src_ip, dst_ip, protocol, header_length)
-        },
+        }
         6 => {
             // IPv6 (simplified)
             let protocol = ip_header[6];
@@ -168,7 +232,7 @@ fn parse_packet(packet: &[u8]) -> Result<Flow, Box<dyn Error>> {
                 ((ip_header[38] as u16) << 8) | ip_header[39] as u16,
             ));
             (src_ip, dst_ip, protocol, 40)
-        },
+        }
         _ => return Err("Unsupported IP version".into()),
     };
 

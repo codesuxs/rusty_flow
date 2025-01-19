@@ -1,10 +1,34 @@
+use ctrlc;
 use pcap::{Capture, Device};
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::IpAddr;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+#[derive(Debug)]
+enum FlowTrackerError {
+    ParseError(String),
+    ChannelError(String),
+    CaptureError(String),
+}
+
+impl std::fmt::Display for FlowTrackerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            FlowTrackerError::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            FlowTrackerError::ChannelError(msg) => write!(f, "Channel error: {}", msg),
+            FlowTrackerError::CaptureError(msg) => write!(f, "Capture error: {}", msg),
+        }
+    }
+}
+
+impl Error for FlowTrackerError {}
 
 // Structure to represent a network flow
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -104,20 +128,27 @@ impl FlowTracker {
     }
 }
 
-fn packet_parser_thread(rx: Receiver<Vec<u8>>) -> Result<Receiver<PacketInfo>, Box<dyn Error>> {
+fn packet_parser_thread(
+    rx: Receiver<Vec<u8>>,
+    running: Arc<AtomicBool>,
+) -> Result<Receiver<PacketInfo>, Box<dyn Error>> {
     let (tx, rx_main) = channel();
-    let tx_clone = tx.clone();
-
     thread::spawn(move || {
-        while let Ok(packet_data) = rx.recv() {
-            if let Ok(flow) = parse_packet(&packet_data) {
-                let packet_info = PacketInfo {
-                    flow,
-                    bytes: packet_data.len() as u64,
-                };
-                if tx_clone.send(packet_info).is_err() {
-                    break;
+        while running.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(packet_data) => {
+                    if let Ok(flow) = parse_packet(&packet_data) {
+                        let packet_info = PacketInfo {
+                            flow,
+                            bytes: packet_data.len() as u64,
+                        };
+                        if tx.send(packet_info).is_err() {
+                            eprintln!("Error sending parsed packet info");
+                            break;
+                        }
+                    }
                 }
+                Err(_) => continue,
             }
         }
     });
@@ -125,9 +156,53 @@ fn packet_parser_thread(rx: Receiver<Vec<u8>>) -> Result<Receiver<PacketInfo>, B
     Ok(rx_main)
 }
 
+fn stats_thread(
+    rx_parsed: Receiver<PacketInfo>,
+    running: Arc<AtomicBool>,
+) -> Result<(), FlowTrackerError> {
+    let mut flow_tracker = FlowTracker::new();
+    let mut last_print = SystemTime::now();
+    let print_interval = Duration::from_secs(5);
+
+    while running.load(Ordering::Relaxed) {
+        // TODO: Get rid of timeout for a sentinel value of empty packet info
+        match rx_parsed.recv_timeout(Duration::from_millis(100)) {
+            Ok(packet_info) => {
+                flow_tracker.update_flow(packet_info.flow, packet_info.bytes);
+
+                if SystemTime::now()
+                    .duration_since(last_print)
+                    .unwrap_or(Duration::from_secs(0))
+                    >= print_interval
+                {
+                    flow_tracker.print_stats();
+                    last_print = SystemTime::now();
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    // Final statistics print before shutdown
+    flow_tracker.print_stats();
+    println!("\nStats thread shutting down...");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    // Setup shutdown signal handling
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        println!("\nShutting down...");
+        r.store(false, Ordering::Relaxed);
+    })?;
+
     // Find the default device
-    let default_device = Device::lookup()?.expect("No default device found");
+    let default_device = Device::lookup()?.ok_or(FlowTrackerError::CaptureError(
+        "No default device found".to_string(),
+    ))?;
 
     println!("Using device: {}", default_device.name);
 
@@ -135,7 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut cap = Capture::from_device(default_device)?
         .promisc(true)
         .snaplen(65535)
-        .timeout(1000)
+        .immediate_mode(true)
         .open()?;
 
     // Set filter for TCP and UDP traffic
@@ -143,42 +218,49 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Create channels for communication between threads
     let (tx_parser, rx_parser) = channel();
-    let tx_main = packet_parser_thread(rx_parser)?;
-
-    let mut flow_tracker = FlowTracker::new();
-    let mut last_print = SystemTime::now();
-    let print_interval = Duration::from_secs(5);
+    let rx_main = packet_parser_thread(rx_parser, running.clone())?;
 
     println!("Starting flow tracking. Press Ctrl+C to stop.");
 
-    // Spawn a thread to handle statistics printing
-    let (tx_stats, rx_stats) = channel::<PacketInfo>();
-    thread::spawn(move || {
-        while let Ok(packet_info) = rx_stats.recv() {
-            flow_tracker.update_flow(packet_info.flow, packet_info.bytes);
+    // Spawn stats thread
+    let stats_handle = {
+        let running = running.clone();
+        thread::spawn(move || stats_thread(rx_main, running))
+    };
 
-            if SystemTime::now()
-                .duration_since(last_print)
-                .unwrap_or(Duration::from_secs(0))
-                >= print_interval
-            {
-                flow_tracker.print_stats();
-                last_print = SystemTime::now();
+    // Main capture loop with error recovery
+    while running.load(Ordering::Relaxed) {
+        match cap.next_packet() {
+            Ok(packet) => {
+                if tx_parser.send(packet.data.to_vec()).is_err() {
+                    eprintln!("Error sending packet data to parser thread");
+                    break;
+                }
             }
-        }
-    });
-
-    // Main capture loop
-    while let Ok(packet) = cap.next_packet() {
-        // Send packet data to parser thread
-        tx_parser.send(packet.data.to_vec())?;
-
-        // Forward parsed packet info to stats thread
-        if let Ok(packet_info) = tx_main.recv() {
-            tx_stats.send(packet_info)?;
+            Err(pcap::Error::TimeoutExpired) => continue,
+            Err(e) => {
+                eprintln!("Capture error: {}", e);
+                // Attempt to recover by reopening capture
+                match Capture::from_device(Device::lookup()?.ok_or("No device")?)?.open() {
+                    Ok(new_cap) => {
+                        cap = new_cap;
+                        println!("Successfully recovered capture");
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to recover capture: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
+    // Wait for stats thread
+    if let Err(e) = stats_handle.join() {
+        eprintln!("Error joining stats thread: {:?}", e);
+    }
+
+    println!("Shutdown complete.");
     Ok(())
 }
 
